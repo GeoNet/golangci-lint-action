@@ -331,10 +331,7 @@ function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false)
     }
     // Add salt to cache version to support breaking changes in cache entry
     components.push(versionSalt);
-    return crypto
-        .createHash('sha256')
-        .update(components.join('|'))
-        .digest('hex');
+    return crypto.createHash('sha256').update(components.join('|')).digest('hex');
 }
 exports.getCacheVersion = getCacheVersion;
 function getCacheEntry(keys, paths, options) {
@@ -387,13 +384,21 @@ function downloadCache(archiveLocation, archivePath, options) {
     return __awaiter(this, void 0, void 0, function* () {
         const archiveUrl = new url_1.URL(archiveLocation);
         const downloadOptions = (0, options_1.getDownloadOptions)(options);
-        if (downloadOptions.useAzureSdk &&
-            archiveUrl.hostname.endsWith('.blob.core.windows.net')) {
-            // Use Azure storage SDK to download caches hosted on Azure to improve speed and reliability.
-            yield (0, downloadUtils_1.downloadCacheStorageSDK)(archiveLocation, archivePath, downloadOptions);
+        if (archiveUrl.hostname.endsWith('.blob.core.windows.net')) {
+            if (downloadOptions.useAzureSdk) {
+                // Use Azure storage SDK to download caches hosted on Azure to improve speed and reliability.
+                yield (0, downloadUtils_1.downloadCacheStorageSDK)(archiveLocation, archivePath, downloadOptions);
+            }
+            else if (downloadOptions.concurrentBlobDownloads) {
+                // Use concurrent implementation with HttpClient to work around blob SDK issue
+                yield (0, downloadUtils_1.downloadCacheHttpClientConcurrent)(archiveLocation, archivePath, downloadOptions);
+            }
+            else {
+                // Otherwise, download using the Actions http-client.
+                yield (0, downloadUtils_1.downloadCacheHttpClient)(archiveLocation, archivePath);
+            }
         }
         else {
-            // Otherwise, download using the Actions http-client.
             yield (0, downloadUtils_1.downloadCacheHttpClient)(archiveLocation, archivePath);
         }
     });
@@ -426,9 +431,7 @@ function getContentRange(start, end) {
 }
 function uploadChunk(httpClient, resourceUrl, openStream, start, end) {
     return __awaiter(this, void 0, void 0, function* () {
-        core.debug(`Uploading chunk of size ${end -
-            start +
-            1} bytes at offset ${start} with content range: ${getContentRange(start, end)}`);
+        core.debug(`Uploading chunk of size ${end - start + 1} bytes at offset ${start} with content range: ${getContentRange(start, end)}`);
         const additionalHeaders = {
             'Content-Type': 'application/octet-stream',
             'Content-Range': getContentRange(start, end)
@@ -596,35 +599,42 @@ function getArchiveFileSizeInBytes(filePath) {
 }
 exports.getArchiveFileSizeInBytes = getArchiveFileSizeInBytes;
 function resolvePaths(patterns) {
-    var e_1, _a;
-    var _b;
+    var _a, e_1, _b, _c;
+    var _d;
     return __awaiter(this, void 0, void 0, function* () {
         const paths = [];
-        const workspace = (_b = process.env['GITHUB_WORKSPACE']) !== null && _b !== void 0 ? _b : process.cwd();
+        const workspace = (_d = process.env['GITHUB_WORKSPACE']) !== null && _d !== void 0 ? _d : process.cwd();
         const globber = yield glob.create(patterns.join('\n'), {
             implicitDescendants: false
         });
         try {
-            for (var _c = __asyncValues(globber.globGenerator()), _d; _d = yield _c.next(), !_d.done;) {
-                const file = _d.value;
-                const relativeFile = path
-                    .relative(workspace, file)
-                    .replace(new RegExp(`\\${path.sep}`, 'g'), '/');
-                core.debug(`Matched: ${relativeFile}`);
-                // Paths are made relative so the tar entries are all relative to the root of the workspace.
-                if (relativeFile === '') {
-                    // path.relative returns empty string if workspace and file are equal
-                    paths.push('.');
+            for (var _e = true, _f = __asyncValues(globber.globGenerator()), _g; _g = yield _f.next(), _a = _g.done, !_a;) {
+                _c = _g.value;
+                _e = false;
+                try {
+                    const file = _c;
+                    const relativeFile = path
+                        .relative(workspace, file)
+                        .replace(new RegExp(`\\${path.sep}`, 'g'), '/');
+                    core.debug(`Matched: ${relativeFile}`);
+                    // Paths are made relative so the tar entries are all relative to the root of the workspace.
+                    if (relativeFile === '') {
+                        // path.relative returns empty string if workspace and file are equal
+                        paths.push('.');
+                    }
+                    else {
+                        paths.push(`${relativeFile}`);
+                    }
                 }
-                else {
-                    paths.push(`${relativeFile}`);
+                finally {
+                    _e = true;
                 }
             }
         }
         catch (e_1_1) { e_1 = { error: e_1_1 }; }
         finally {
             try {
-                if (_d && !_d.done && (_a = _c.return)) yield _a.call(_c);
+                if (!_e && !_a && (_b = _f.return)) yield _b.call(_f);
             }
             finally { if (e_1) throw e_1.error; }
         }
@@ -789,7 +799,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.downloadCacheStorageSDK = exports.downloadCacheHttpClient = exports.DownloadProgress = void 0;
+exports.downloadCacheStorageSDK = exports.downloadCacheHttpClientConcurrent = exports.downloadCacheHttpClient = exports.DownloadProgress = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const http_client_1 = __nccwpck_require__(6255);
 const storage_blob_1 = __nccwpck_require__(4100);
@@ -946,6 +956,115 @@ function downloadCacheHttpClient(archiveLocation, archivePath) {
     });
 }
 exports.downloadCacheHttpClient = downloadCacheHttpClient;
+/**
+ * Download the cache using the Actions toolkit http-client concurrently
+ *
+ * @param archiveLocation the URL for the cache
+ * @param archivePath the local path where the cache is saved
+ */
+function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        const archiveDescriptor = yield fs.promises.open(archivePath, 'w');
+        const httpClient = new http_client_1.HttpClient('actions/cache', undefined, {
+            socketTimeout: options.timeoutInMs,
+            keepAlive: true
+        });
+        try {
+            const res = yield (0, requestUtils_1.retryHttpClientResponse)('downloadCacheMetadata', () => __awaiter(this, void 0, void 0, function* () { return yield httpClient.request('HEAD', archiveLocation, null, {}); }));
+            const lengthHeader = res.message.headers['content-length'];
+            if (lengthHeader === undefined || lengthHeader === null) {
+                throw new Error('Content-Length not found on blob response');
+            }
+            const length = parseInt(lengthHeader);
+            if (Number.isNaN(length)) {
+                throw new Error(`Could not interpret Content-Length: ${length}`);
+            }
+            const downloads = [];
+            const blockSize = 4 * 1024 * 1024;
+            for (let offset = 0; offset < length; offset += blockSize) {
+                const count = Math.min(blockSize, length - offset);
+                downloads.push({
+                    offset,
+                    promiseGetter: () => __awaiter(this, void 0, void 0, function* () {
+                        return yield downloadSegmentRetry(httpClient, archiveLocation, offset, count);
+                    })
+                });
+            }
+            // reverse to use .pop instead of .shift
+            downloads.reverse();
+            let actives = 0;
+            let bytesDownloaded = 0;
+            const progress = new DownloadProgress(length);
+            progress.startDisplayTimer();
+            const progressFn = progress.onProgress();
+            const activeDownloads = [];
+            let nextDownload;
+            const waitAndWrite = () => __awaiter(this, void 0, void 0, function* () {
+                const segment = yield Promise.race(Object.values(activeDownloads));
+                yield archiveDescriptor.write(segment.buffer, 0, segment.count, segment.offset);
+                actives--;
+                delete activeDownloads[segment.offset];
+                bytesDownloaded += segment.count;
+                progressFn({ loadedBytes: bytesDownloaded });
+            });
+            while ((nextDownload = downloads.pop())) {
+                activeDownloads[nextDownload.offset] = nextDownload.promiseGetter();
+                actives++;
+                if (actives >= ((_a = options.downloadConcurrency) !== null && _a !== void 0 ? _a : 10)) {
+                    yield waitAndWrite();
+                }
+            }
+            while (actives > 0) {
+                yield waitAndWrite();
+            }
+        }
+        finally {
+            httpClient.dispose();
+            yield archiveDescriptor.close();
+        }
+    });
+}
+exports.downloadCacheHttpClientConcurrent = downloadCacheHttpClientConcurrent;
+function downloadSegmentRetry(httpClient, archiveLocation, offset, count) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const retries = 5;
+        let failures = 0;
+        while (true) {
+            try {
+                const timeout = 30000;
+                const result = yield promiseWithTimeout(timeout, downloadSegment(httpClient, archiveLocation, offset, count));
+                if (typeof result === 'string') {
+                    throw new Error('downloadSegmentRetry failed due to timeout');
+                }
+                return result;
+            }
+            catch (err) {
+                if (failures >= retries) {
+                    throw err;
+                }
+                failures++;
+            }
+        }
+    });
+}
+function downloadSegment(httpClient, archiveLocation, offset, count) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const partRes = yield (0, requestUtils_1.retryHttpClientResponse)('downloadCachePart', () => __awaiter(this, void 0, void 0, function* () {
+            return yield httpClient.get(archiveLocation, {
+                Range: `bytes=${offset}-${offset + count - 1}`
+            });
+        }));
+        if (!partRes.readBodyBuffer) {
+            throw new Error('Expected HttpClientResponse to implement readBodyBuffer');
+        }
+        return {
+            offset,
+            count,
+            buffer: yield partRes.readBodyBuffer()
+        };
+    });
+}
 /**
  * Download the cache using the Azure Storage SDK.  Only call this method if the
  * URL points to an Azure Storage endpoint.
@@ -1511,7 +1630,8 @@ exports.getUploadOptions = getUploadOptions;
  */
 function getDownloadOptions(copy) {
     const result = {
-        useAzureSdk: true,
+        useAzureSdk: false,
+        concurrentBlobDownloads: true,
         downloadConcurrency: 8,
         timeoutInMs: 30000,
         segmentTimeoutInMs: 600000,
@@ -1520,6 +1640,9 @@ function getDownloadOptions(copy) {
     if (copy) {
         if (typeof copy.useAzureSdk === 'boolean') {
             result.useAzureSdk = copy.useAzureSdk;
+        }
+        if (typeof copy.concurrentBlobDownloads === 'boolean') {
+            result.concurrentBlobDownloads = copy.concurrentBlobDownloads;
         }
         if (typeof copy.downloadConcurrency === 'number') {
             result.downloadConcurrency = copy.downloadConcurrency;
@@ -5423,6 +5546,19 @@ class HttpClientResponse {
             }));
         });
     }
+    readBodyBuffer() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve) => __awaiter(this, void 0, void 0, function* () {
+                const chunks = [];
+                this.message.on('data', (chunk) => {
+                    chunks.push(chunk);
+                });
+                this.message.on('end', () => {
+                    resolve(Buffer.concat(chunks));
+                });
+            }));
+        });
+    }
 }
 exports.HttpClientResponse = HttpClientResponse;
 function isHttps(requestUrl) {
@@ -5927,7 +6063,13 @@ function getProxyUrl(reqUrl) {
         }
     })();
     if (proxyVar) {
-        return new URL(proxyVar);
+        try {
+            return new URL(proxyVar);
+        }
+        catch (_a) {
+            if (!proxyVar.startsWith('http://') && !proxyVar.startsWith('https://'))
+                return new URL(`http://${proxyVar}`);
+        }
     }
     else {
         return undefined;
@@ -56018,14 +56160,42 @@ var MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER ||
 // Max safe segment length for coercion.
 var MAX_SAFE_COMPONENT_LENGTH = 16
 
+var MAX_SAFE_BUILD_LENGTH = MAX_LENGTH - 6
+
 // The actual regexps go on exports.re
 var re = exports.re = []
+var safeRe = exports.safeRe = []
 var src = exports.src = []
 var t = exports.tokens = {}
 var R = 0
 
 function tok (n) {
   t[n] = R++
+}
+
+var LETTERDASHNUMBER = '[a-zA-Z0-9-]'
+
+// Replace some greedy regex tokens to prevent regex dos issues. These regex are
+// used internally via the safeRe object since all inputs in this library get
+// normalized first to trim and collapse all extra whitespace. The original
+// regexes are exported for userland consumption and lower level usage. A
+// future breaking change could export the safer regex only with a note that
+// all input should have extra whitespace removed.
+var safeRegexReplacements = [
+  ['\\s', 1],
+  ['\\d', MAX_LENGTH],
+  [LETTERDASHNUMBER, MAX_SAFE_BUILD_LENGTH],
+]
+
+function makeSafeRe (value) {
+  for (var i = 0; i < safeRegexReplacements.length; i++) {
+    var token = safeRegexReplacements[i][0]
+    var max = safeRegexReplacements[i][1]
+    value = value
+      .split(token + '*').join(token + '{0,' + max + '}')
+      .split(token + '+').join(token + '{1,' + max + '}')
+  }
+  return value
 }
 
 // The following Regular Expressions can be used for tokenizing,
@@ -56037,14 +56207,14 @@ function tok (n) {
 tok('NUMERICIDENTIFIER')
 src[t.NUMERICIDENTIFIER] = '0|[1-9]\\d*'
 tok('NUMERICIDENTIFIERLOOSE')
-src[t.NUMERICIDENTIFIERLOOSE] = '[0-9]+'
+src[t.NUMERICIDENTIFIERLOOSE] = '\\d+'
 
 // ## Non-numeric Identifier
 // Zero or more digits, followed by a letter or hyphen, and then zero or
 // more letters, digits, or hyphens.
 
 tok('NONNUMERICIDENTIFIER')
-src[t.NONNUMERICIDENTIFIER] = '\\d*[a-zA-Z-][a-zA-Z0-9-]*'
+src[t.NONNUMERICIDENTIFIER] = '\\d*[a-zA-Z-]' + LETTERDASHNUMBER + '*'
 
 // ## Main Version
 // Three dot-separated numeric identifiers.
@@ -56086,7 +56256,7 @@ src[t.PRERELEASELOOSE] = '(?:-?(' + src[t.PRERELEASEIDENTIFIERLOOSE] +
 // Any combination of digits, letters, or hyphens.
 
 tok('BUILDIDENTIFIER')
-src[t.BUILDIDENTIFIER] = '[0-9A-Za-z-]+'
+src[t.BUILDIDENTIFIER] = LETTERDASHNUMBER + '+'
 
 // ## Build Metadata
 // Plus sign, followed by one or more period-separated build metadata
@@ -56166,6 +56336,7 @@ src[t.COERCE] = '(^|[^\\d])' +
               '(?:$|[^\\d])'
 tok('COERCERTL')
 re[t.COERCERTL] = new RegExp(src[t.COERCE], 'g')
+safeRe[t.COERCERTL] = new RegExp(makeSafeRe(src[t.COERCE]), 'g')
 
 // Tilde ranges.
 // Meaning is "reasonably at or greater than"
@@ -56175,6 +56346,7 @@ src[t.LONETILDE] = '(?:~>?)'
 tok('TILDETRIM')
 src[t.TILDETRIM] = '(\\s*)' + src[t.LONETILDE] + '\\s+'
 re[t.TILDETRIM] = new RegExp(src[t.TILDETRIM], 'g')
+safeRe[t.TILDETRIM] = new RegExp(makeSafeRe(src[t.TILDETRIM]), 'g')
 var tildeTrimReplace = '$1~'
 
 tok('TILDE')
@@ -56190,6 +56362,7 @@ src[t.LONECARET] = '(?:\\^)'
 tok('CARETTRIM')
 src[t.CARETTRIM] = '(\\s*)' + src[t.LONECARET] + '\\s+'
 re[t.CARETTRIM] = new RegExp(src[t.CARETTRIM], 'g')
+safeRe[t.CARETTRIM] = new RegExp(makeSafeRe(src[t.CARETTRIM]), 'g')
 var caretTrimReplace = '$1^'
 
 tok('CARET')
@@ -56211,6 +56384,7 @@ src[t.COMPARATORTRIM] = '(\\s*)' + src[t.GTLT] +
 
 // this one has to use the /g flag
 re[t.COMPARATORTRIM] = new RegExp(src[t.COMPARATORTRIM], 'g')
+safeRe[t.COMPARATORTRIM] = new RegExp(makeSafeRe(src[t.COMPARATORTRIM]), 'g')
 var comparatorTrimReplace = '$1$2$3'
 
 // Something like `1.2.3 - 1.2.4`
@@ -56239,6 +56413,14 @@ for (var i = 0; i < R; i++) {
   debug(i, src[i])
   if (!re[i]) {
     re[i] = new RegExp(src[i])
+
+    // Replace all greedy whitespace to prevent regex dos issues. These regex are
+    // used internally via the safeRe object since all inputs in this library get
+    // normalized first to trim and collapse all extra whitespace. The original
+    // regexes are exported for userland consumption and lower level usage. A
+    // future breaking change could export the safer regex only with a note that
+    // all input should have extra whitespace removed.
+    safeRe[i] = new RegExp(makeSafeRe(src[i]))
   }
 }
 
@@ -56263,7 +56445,7 @@ function parse (version, options) {
     return null
   }
 
-  var r = options.loose ? re[t.LOOSE] : re[t.FULL]
+  var r = options.loose ? safeRe[t.LOOSE] : safeRe[t.FULL]
   if (!r.test(version)) {
     return null
   }
@@ -56318,7 +56500,7 @@ function SemVer (version, options) {
   this.options = options
   this.loose = !!options.loose
 
-  var m = version.trim().match(options.loose ? re[t.LOOSE] : re[t.FULL])
+  var m = version.trim().match(options.loose ? safeRe[t.LOOSE] : safeRe[t.FULL])
 
   if (!m) {
     throw new TypeError('Invalid Version: ' + version)
@@ -56763,6 +56945,7 @@ function Comparator (comp, options) {
     return new Comparator(comp, options)
   }
 
+  comp = comp.trim().split(/\s+/).join(' ')
   debug('comparator', comp, options)
   this.options = options
   this.loose = !!options.loose
@@ -56779,7 +56962,7 @@ function Comparator (comp, options) {
 
 var ANY = {}
 Comparator.prototype.parse = function (comp) {
-  var r = this.options.loose ? re[t.COMPARATORLOOSE] : re[t.COMPARATOR]
+  var r = this.options.loose ? safeRe[t.COMPARATORLOOSE] : safeRe[t.COMPARATOR]
   var m = comp.match(r)
 
   if (!m) {
@@ -56903,9 +57086,16 @@ function Range (range, options) {
   this.loose = !!options.loose
   this.includePrerelease = !!options.includePrerelease
 
-  // First, split based on boolean or ||
+  // First reduce all whitespace as much as possible so we do not have to rely
+  // on potentially slow regexes like \s*. This is then stored and used for
+  // future error messages as well.
   this.raw = range
-  this.set = range.split(/\s*\|\|\s*/).map(function (range) {
+    .trim()
+    .split(/\s+/)
+    .join(' ')
+
+  // First, split based on boolean or ||
+  this.set = this.raw.split('||').map(function (range) {
     return this.parseRange(range.trim())
   }, this).filter(function (c) {
     // throw out any that are not relevant for whatever reason
@@ -56913,7 +57103,7 @@ function Range (range, options) {
   })
 
   if (!this.set.length) {
-    throw new TypeError('Invalid SemVer Range: ' + range)
+    throw new TypeError('Invalid SemVer Range: ' + this.raw)
   }
 
   this.format()
@@ -56932,20 +57122,19 @@ Range.prototype.toString = function () {
 
 Range.prototype.parseRange = function (range) {
   var loose = this.options.loose
-  range = range.trim()
   // `1.2.3 - 1.2.4` => `>=1.2.3 <=1.2.4`
-  var hr = loose ? re[t.HYPHENRANGELOOSE] : re[t.HYPHENRANGE]
+  var hr = loose ? safeRe[t.HYPHENRANGELOOSE] : safeRe[t.HYPHENRANGE]
   range = range.replace(hr, hyphenReplace)
   debug('hyphen replace', range)
   // `> 1.2.3 < 1.2.5` => `>1.2.3 <1.2.5`
-  range = range.replace(re[t.COMPARATORTRIM], comparatorTrimReplace)
-  debug('comparator trim', range, re[t.COMPARATORTRIM])
+  range = range.replace(safeRe[t.COMPARATORTRIM], comparatorTrimReplace)
+  debug('comparator trim', range, safeRe[t.COMPARATORTRIM])
 
   // `~ 1.2.3` => `~1.2.3`
-  range = range.replace(re[t.TILDETRIM], tildeTrimReplace)
+  range = range.replace(safeRe[t.TILDETRIM], tildeTrimReplace)
 
   // `^ 1.2.3` => `^1.2.3`
-  range = range.replace(re[t.CARETTRIM], caretTrimReplace)
+  range = range.replace(safeRe[t.CARETTRIM], caretTrimReplace)
 
   // normalize spaces
   range = range.split(/\s+/).join(' ')
@@ -56953,7 +57142,7 @@ Range.prototype.parseRange = function (range) {
   // At this point, the range is completely trimmed and
   // ready to be split into comparators.
 
-  var compRe = loose ? re[t.COMPARATORLOOSE] : re[t.COMPARATOR]
+  var compRe = loose ? safeRe[t.COMPARATORLOOSE] : safeRe[t.COMPARATOR]
   var set = range.split(' ').map(function (comp) {
     return parseComparator(comp, this.options)
   }, this).join(' ').split(/\s+/)
@@ -57053,7 +57242,7 @@ function replaceTildes (comp, options) {
 }
 
 function replaceTilde (comp, options) {
-  var r = options.loose ? re[t.TILDELOOSE] : re[t.TILDE]
+  var r = options.loose ? safeRe[t.TILDELOOSE] : safeRe[t.TILDE]
   return comp.replace(r, function (_, M, m, p, pr) {
     debug('tilde', comp, _, M, m, p, pr)
     var ret
@@ -57094,7 +57283,7 @@ function replaceCarets (comp, options) {
 
 function replaceCaret (comp, options) {
   debug('caret', comp, options)
-  var r = options.loose ? re[t.CARETLOOSE] : re[t.CARET]
+  var r = options.loose ? safeRe[t.CARETLOOSE] : safeRe[t.CARET]
   return comp.replace(r, function (_, M, m, p, pr) {
     debug('caret', comp, _, M, m, p, pr)
     var ret
@@ -57153,7 +57342,7 @@ function replaceXRanges (comp, options) {
 
 function replaceXRange (comp, options) {
   comp = comp.trim()
-  var r = options.loose ? re[t.XRANGELOOSE] : re[t.XRANGE]
+  var r = options.loose ? safeRe[t.XRANGELOOSE] : safeRe[t.XRANGE]
   return comp.replace(r, function (ret, gtlt, M, m, p, pr) {
     debug('xRange', comp, ret, gtlt, M, m, p, pr)
     var xM = isX(M)
@@ -57228,7 +57417,7 @@ function replaceXRange (comp, options) {
 function replaceStars (comp, options) {
   debug('replaceStars', comp, options)
   // Looseness is ignored here.  star is always as loose as it gets!
-  return comp.trim().replace(re[t.STAR], '')
+  return comp.trim().replace(safeRe[t.STAR], '')
 }
 
 // This function is passed to string.replace(re[t.HYPHENRANGE])
@@ -57554,7 +57743,7 @@ function coerce (version, options) {
 
   var match = null
   if (!options.rtl) {
-    match = version.match(re[t.COERCE])
+    match = version.match(safeRe[t.COERCE])
   } else {
     // Find the right-most coercible string that does not share
     // a terminus with a more left-ward coercible string.
@@ -57565,17 +57754,17 @@ function coerce (version, options) {
     // Stop when we get a match that ends at the string end, since no
     // coercible string can be more right-ward without the same terminus.
     var next
-    while ((next = re[t.COERCERTL].exec(version)) &&
+    while ((next = safeRe[t.COERCERTL].exec(version)) &&
       (!match || match.index + match[0].length !== version.length)
     ) {
       if (!match ||
           next.index + next[0].length !== match.index + match[0].length) {
         match = next
       }
-      re[t.COERCERTL].lastIndex = next.index + next[1].length + next[2].length
+      safeRe[t.COERCERTL].lastIndex = next.index + next[1].length + next[2].length
     }
     // leave it in a clean state
-    re[t.COERCERTL].lastIndex = -1
+    safeRe[t.COERCERTL].lastIndex = -1
   }
 
   if (match === null) {
@@ -66135,15 +66324,6 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -66165,7 +66345,7 @@ function checksumFile(hashName, path) {
         stream.on("end", () => resolve(hash.digest("hex")));
     });
 }
-const pathExists = (path) => __awaiter(void 0, void 0, void 0, function* () { return !!(yield fs.promises.stat(path).catch(() => false)); });
+const pathExists = async (path) => !!(await fs.promises.stat(path).catch(() => false));
 const getLintCacheDir = () => {
     return path_1.default.resolve(`${process.env.HOME}/.cache/golangci-lint`);
 };
@@ -66194,106 +66374,100 @@ const getIntervalKey = (invalidationIntervalDays) => {
     const intervalNumber = Math.floor(secondsSinceEpoch / (invalidationIntervalDays * 86400));
     return intervalNumber.toString();
 };
-function buildCacheKeys() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const keys = [];
-        // Periodically invalidate a cache because a new code being added.
-        // TODO: configure it via inputs.
-        let cacheKey = `golangci-lint.cache-${getIntervalKey(7)}-`;
-        keys.push(cacheKey);
-        // Get working directory from input
-        const workingDirectory = core.getInput(`working-directory`);
-        // create path to go.mod prepending the workingDirectory if it exists
-        const goModPath = path_1.default.join(workingDirectory, `go.mod`);
-        core.info(`Checking for go.mod: ${goModPath}`);
-        if (yield pathExists(goModPath)) {
-            // Add checksum to key to invalidate a cache when dependencies change.
-            cacheKey += yield checksumFile(`sha1`, goModPath);
+async function buildCacheKeys() {
+    const keys = [];
+    // Periodically invalidate a cache because a new code being added.
+    // TODO: configure it via inputs.
+    let cacheKey = `golangci-lint.cache-${getIntervalKey(7)}-`;
+    keys.push(cacheKey);
+    // Get working directory from input
+    const workingDirectory = core.getInput(`working-directory`);
+    // create path to go.mod prepending the workingDirectory if it exists
+    const goModPath = path_1.default.join(workingDirectory, `go.mod`);
+    core.info(`Checking for go.mod: ${goModPath}`);
+    if (await pathExists(goModPath)) {
+        // Add checksum to key to invalidate a cache when dependencies change.
+        cacheKey += await checksumFile(`sha1`, goModPath);
+    }
+    else {
+        cacheKey += `nogomod`;
+    }
+    keys.push(cacheKey);
+    return keys;
+}
+async function restoreCache() {
+    if (core.getInput(`skip-cache`, { required: true }).trim() == "true")
+        return;
+    if (!utils.isValidEvent()) {
+        utils.logWarning(`Event Validation Error: The event type ${process.env[constants_1.Events.Key]} is not supported because it's not tied to a branch or tag ref.`);
+        return;
+    }
+    const startedAt = Date.now();
+    const keys = await buildCacheKeys();
+    const primaryKey = keys.pop();
+    const restoreKeys = keys.reverse();
+    // Tell golangci-lint to use our cache directory.
+    process.env.GOLANGCI_LINT_CACHE = getLintCacheDir();
+    if (!primaryKey) {
+        utils.logWarning(`Invalid primary key`);
+        return;
+    }
+    core.saveState(constants_1.State.CachePrimaryKey, primaryKey);
+    try {
+        const cacheKey = await cache.restoreCache(getCacheDirs(), primaryKey, restoreKeys);
+        if (!cacheKey) {
+            core.info(`Cache not found for input keys: ${[primaryKey, ...restoreKeys].join(", ")}`);
+            return;
+        }
+        // Store the matched cache key
+        utils.setCacheState(cacheKey);
+        core.info(`Restored cache for golangci-lint from key '${primaryKey}' in ${Date.now() - startedAt}ms`);
+    }
+    catch (error) {
+        if (error.name === cache.ValidationError.name) {
+            throw error;
         }
         else {
-            cacheKey += `nogomod`;
+            core.warning(error.message);
         }
-        keys.push(cacheKey);
-        return keys;
-    });
-}
-function restoreCache() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (core.getInput(`skip-cache`, { required: true }).trim() == "true")
-            return;
-        if (!utils.isValidEvent()) {
-            utils.logWarning(`Event Validation Error: The event type ${process.env[constants_1.Events.Key]} is not supported because it's not tied to a branch or tag ref.`);
-            return;
-        }
-        const startedAt = Date.now();
-        const keys = yield buildCacheKeys();
-        const primaryKey = keys.pop();
-        const restoreKeys = keys.reverse();
-        // Tell golangci-lint to use our cache directory.
-        process.env.GOLANGCI_LINT_CACHE = getLintCacheDir();
-        if (!primaryKey) {
-            utils.logWarning(`Invalid primary key`);
-            return;
-        }
-        core.saveState(constants_1.State.CachePrimaryKey, primaryKey);
-        try {
-            const cacheKey = yield cache.restoreCache(getCacheDirs(), primaryKey, restoreKeys);
-            if (!cacheKey) {
-                core.info(`Cache not found for input keys: ${[primaryKey, ...restoreKeys].join(", ")}`);
-                return;
-            }
-            // Store the matched cache key
-            utils.setCacheState(cacheKey);
-            core.info(`Restored cache for golangci-lint from key '${primaryKey}' in ${Date.now() - startedAt}ms`);
-        }
-        catch (error) {
-            if (error.name === cache.ValidationError.name) {
-                throw error;
-            }
-            else {
-                core.warning(error.message);
-            }
-        }
-    });
+    }
 }
 exports.restoreCache = restoreCache;
-function saveCache() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (core.getInput(`skip-cache`, { required: true }).trim() == "true")
-            return;
-        // Validate inputs, this can cause task failure
-        if (!utils.isValidEvent()) {
-            utils.logWarning(`Event Validation Error: The event type ${process.env[constants_1.Events.Key]} is not supported because it's not tied to a branch or tag ref.`);
-            return;
+async function saveCache() {
+    if (core.getInput(`skip-cache`, { required: true }).trim() == "true")
+        return;
+    // Validate inputs, this can cause task failure
+    if (!utils.isValidEvent()) {
+        utils.logWarning(`Event Validation Error: The event type ${process.env[constants_1.Events.Key]} is not supported because it's not tied to a branch or tag ref.`);
+        return;
+    }
+    const startedAt = Date.now();
+    const cacheDirs = getCacheDirs();
+    const primaryKey = core.getState(constants_1.State.CachePrimaryKey);
+    if (!primaryKey) {
+        utils.logWarning(`Error retrieving key from state.`);
+        return;
+    }
+    const state = utils.getCacheState();
+    if (utils.isExactKeyMatch(primaryKey, state)) {
+        core.info(`Cache hit occurred on the primary key ${primaryKey}, not saving cache.`);
+        return;
+    }
+    try {
+        await cache.saveCache(cacheDirs, primaryKey);
+        core.info(`Saved cache for golangci-lint from paths '${cacheDirs.join(`, `)}' in ${Date.now() - startedAt}ms`);
+    }
+    catch (error) {
+        if (error.name === cache.ValidationError.name) {
+            throw error;
         }
-        const startedAt = Date.now();
-        const cacheDirs = getCacheDirs();
-        const primaryKey = core.getState(constants_1.State.CachePrimaryKey);
-        if (!primaryKey) {
-            utils.logWarning(`Error retrieving key from state.`);
-            return;
+        else if (error.name === cache.ReserveCacheError.name) {
+            core.info(error.message);
         }
-        const state = utils.getCacheState();
-        if (utils.isExactKeyMatch(primaryKey, state)) {
-            core.info(`Cache hit occurred on the primary key ${primaryKey}, not saving cache.`);
-            return;
+        else {
+            core.info(`[warning] ${error.message}`);
         }
-        try {
-            yield cache.saveCache(cacheDirs, primaryKey);
-            core.info(`Saved cache for golangci-lint from paths '${cacheDirs.join(`, `)}' in ${Date.now() - startedAt}ms`);
-        }
-        catch (error) {
-            if (error.name === cache.ValidationError.name) {
-                throw error;
-            }
-            else if (error.name === cache.ReserveCacheError.name) {
-                core.info(error.message);
-            }
-            else {
-                core.info(`[warning] ${error.message}`);
-            }
-        }
-    });
+    }
 }
 exports.saveCache = saveCache;
 
@@ -66312,18 +66486,18 @@ var Inputs;
     Inputs["Key"] = "key";
     Inputs["Path"] = "path";
     Inputs["RestoreKeys"] = "restore-keys";
-})(Inputs = exports.Inputs || (exports.Inputs = {}));
+})(Inputs || (exports.Inputs = Inputs = {}));
 var State;
 (function (State) {
     State["CachePrimaryKey"] = "CACHE_KEY";
     State["CacheMatchedKey"] = "CACHE_RESULT";
-})(State = exports.State || (exports.State = {}));
+})(State || (exports.State = State = {}));
 var Events;
 (function (Events) {
     Events["Key"] = "GITHUB_EVENT_NAME";
     Events["Push"] = "push";
     Events["PullRequest"] = "pull_request";
-})(Events = exports.Events || (exports.Events = {}));
+})(Events || (exports.Events = Events = {}));
 exports.RefKey = "GITHUB_REF";
 
 
@@ -66357,24 +66531,18 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.installLint = void 0;
+exports.installBin = exports.goInstall = exports.installLint = exports.InstallMode = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const tc = __importStar(__nccwpck_require__(7784));
+const child_process_1 = __nccwpck_require__(2081);
 const os_1 = __importDefault(__nccwpck_require__(2037));
 const path_1 = __importDefault(__nccwpck_require__(1017));
+const util_1 = __nccwpck_require__(3837);
+const execShellCommand = (0, util_1.promisify)(child_process_1.exec);
 const downloadURL = "https://github.com/golangci/golangci-lint/releases/download";
 const getAssetURL = (versionConfig) => {
     let ext = "tar.gz";
@@ -66398,36 +66566,91 @@ const getAssetURL = (versionConfig) => {
     const noPrefix = versionConfig.TargetVersion.slice(1);
     return `${downloadURL}/${versionConfig.TargetVersion}/golangci-lint-${noPrefix}-${platform}-${arch}.${ext}`;
 };
-// The installLint returns path to installed binary of golangci-lint.
-function installLint(versionConfig) {
-    return __awaiter(this, void 0, void 0, function* () {
-        core.info(`Installing golangci-lint ${versionConfig.TargetVersion}...`);
-        const startedAt = Date.now();
-        const assetURL = getAssetURL(versionConfig);
-        core.info(`Downloading ${assetURL} ...`);
-        const archivePath = yield tc.downloadTool(assetURL);
-        let extractedDir = "";
-        let repl = /\.tar\.gz$/;
-        if (assetURL.endsWith("zip")) {
-            extractedDir = yield tc.extractZip(archivePath, process.env.HOME);
-            repl = /\.zip$/;
-        }
-        else {
-            // We want to always overwrite files if the local cache already has them
-            const args = ["xz"];
-            if (process.platform.toString() != "darwin") {
-                args.push("--overwrite");
-            }
-            extractedDir = yield tc.extractTar(archivePath, process.env.HOME, args);
-        }
-        const urlParts = assetURL.split(`/`);
-        const dirName = urlParts[urlParts.length - 1].replace(repl, ``);
-        const lintPath = path_1.default.join(extractedDir, dirName, `golangci-lint`);
-        core.info(`Installed golangci-lint into ${lintPath} in ${Date.now() - startedAt}ms`);
-        return lintPath;
-    });
+var InstallMode;
+(function (InstallMode) {
+    InstallMode["Binary"] = "binary";
+    InstallMode["GoInstall"] = "goinstall";
+})(InstallMode || (exports.InstallMode = InstallMode = {}));
+const printOutput = (res) => {
+    if (res.stdout) {
+        core.info(res.stdout);
+    }
+    if (res.stderr) {
+        core.info(res.stderr);
+    }
+};
+/**
+ * Install golangci-lint.
+ *
+ * @param versionConfig information about version to install.
+ * @param mode          installation mode.
+ * @returns             path to installed binary of golangci-lint.
+ */
+async function installLint(versionConfig, mode) {
+    core.info(`Installation mode: ${mode}`);
+    switch (mode) {
+        case InstallMode.Binary:
+            return installBin(versionConfig);
+        case InstallMode.GoInstall:
+            return goInstall(versionConfig);
+        default:
+            return installBin(versionConfig);
+    }
 }
 exports.installLint = installLint;
+/**
+ * Install golangci-lint via `go install`.
+ *
+ * @param versionConfig information about version to install.
+ * @returns             path to installed binary of golangci-lint.
+ */
+async function goInstall(versionConfig) {
+    core.info(`Installing golangci-lint ${versionConfig.TargetVersion}...`);
+    const startedAt = Date.now();
+    const options = { env: { ...process.env, CGO_ENABLED: "1" } };
+    const exres = await execShellCommand(`go install github.com/golangci/golangci-lint/cmd/golangci-lint@${versionConfig.TargetVersion}`, options);
+    printOutput(exres);
+    const res = await execShellCommand(`go install -n github.com/golangci/golangci-lint/cmd/golangci-lint@${versionConfig.TargetVersion}`, options);
+    printOutput(res);
+    // The output of `go install -n` when the binary is already installed is `touch <path_to_the_binary>`.
+    const lintPath = res.stderr.trimStart().trimEnd().split(` `, 2)[1];
+    core.info(`Installed golangci-lint into ${lintPath} in ${Date.now() - startedAt}ms`);
+    return lintPath;
+}
+exports.goInstall = goInstall;
+/**
+ * Install golangci-lint via the precompiled binary.
+ *
+ * @param versionConfig information about version to install.
+ * @returns             path to installed binary of golangci-lint.
+ */
+async function installBin(versionConfig) {
+    core.info(`Installing golangci-lint binary ${versionConfig.TargetVersion}...`);
+    const startedAt = Date.now();
+    const assetURL = getAssetURL(versionConfig);
+    core.info(`Downloading binary ${assetURL} ...`);
+    const archivePath = await tc.downloadTool(assetURL);
+    let extractedDir = "";
+    let repl = /\.tar\.gz$/;
+    if (assetURL.endsWith("zip")) {
+        extractedDir = await tc.extractZip(archivePath, process.env.HOME);
+        repl = /\.zip$/;
+    }
+    else {
+        // We want to always overwrite files if the local cache already has them
+        const args = ["xz"];
+        if (process.platform.toString() != "darwin") {
+            args.push("--overwrite");
+        }
+        extractedDir = await tc.extractTar(archivePath, process.env.HOME, args);
+    }
+    const urlParts = assetURL.split(`/`);
+    const dirName = urlParts[urlParts.length - 1].replace(repl, ``);
+    const lintPath = path_1.default.join(extractedDir, dirName, `golangci-lint`);
+    core.info(`Installed golangci-lint into ${lintPath} in ${Date.now() - startedAt}ms`);
+    return lintPath;
+}
+exports.installBin = installBin;
 
 
 /***/ }),
@@ -66460,15 +66683,6 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.postRun = exports.run = void 0;
 const core = __importStar(__nccwpck_require__(2186));
@@ -66480,83 +66694,78 @@ const tmp_1 = __nccwpck_require__(8517);
 const util_1 = __nccwpck_require__(3837);
 const cache_1 = __nccwpck_require__(4810);
 const install_1 = __nccwpck_require__(1649);
+const diffUtils_1 = __nccwpck_require__(3617);
 const version_1 = __nccwpck_require__(1946);
 const execShellCommand = (0, util_1.promisify)(child_process_1.exec);
 const writeFile = (0, util_1.promisify)(fs.writeFile);
 const createTempDir = (0, util_1.promisify)(tmp_1.dir);
-function prepareLint() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const versionConfig = yield (0, version_1.findLintVersion)();
-        return yield (0, install_1.installLint)(versionConfig);
-    });
+async function prepareLint() {
+    const mode = core.getInput("install-mode").toLowerCase();
+    const versionConfig = await (0, version_1.findLintVersion)(mode);
+    return await (0, install_1.installLint)(versionConfig, mode);
 }
-function fetchPatch() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const onlyNewIssues = core.getInput(`only-new-issues`, { required: true }).trim();
-        if (onlyNewIssues !== `false` && onlyNewIssues !== `true`) {
-            throw new Error(`invalid value of "only-new-issues": "${onlyNewIssues}", expected "true" or "false"`);
-        }
-        if (onlyNewIssues === `false`) {
-            return ``;
-        }
-        const ctx = github.context;
-        if (ctx.eventName !== `pull_request`) {
-            core.info(`Not fetching patch for showing only new issues because it's not a pull request context: event name is ${ctx.eventName}`);
-            return ``;
-        }
-        const pull = ctx.payload.pull_request;
-        if (!pull) {
-            core.warning(`No pull request in context`);
-            return ``;
-        }
-        const octokit = github.getOctokit(core.getInput(`github-token`, { required: true }));
-        let patch;
-        try {
-            const patchResp = yield octokit.rest.pulls.get({
-                owner: ctx.repo.owner,
-                repo: ctx.repo.repo,
-                [`pull_number`]: pull.number,
-                mediaType: {
-                    format: `diff`,
-                },
-            });
-            if (patchResp.status !== 200) {
-                core.warning(`failed to fetch pull request patch: response status is ${patchResp.status}`);
-                return ``; // don't fail the action, but analyze without patch
-            }
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            patch = patchResp.data;
-        }
-        catch (err) {
-            console.warn(`failed to fetch pull request patch:`, err);
+async function fetchPatch() {
+    const onlyNewIssues = core.getInput(`only-new-issues`, { required: true }).trim();
+    if (onlyNewIssues !== `false` && onlyNewIssues !== `true`) {
+        throw new Error(`invalid value of "only-new-issues": "${onlyNewIssues}", expected "true" or "false"`);
+    }
+    if (onlyNewIssues === `false`) {
+        return ``;
+    }
+    const ctx = github.context;
+    if (ctx.eventName !== `pull_request`) {
+        core.info(`Not fetching patch for showing only new issues because it's not a pull request context: event name is ${ctx.eventName}`);
+        return ``;
+    }
+    const pull = ctx.payload.pull_request;
+    if (!pull) {
+        core.warning(`No pull request in context`);
+        return ``;
+    }
+    const octokit = github.getOctokit(core.getInput(`github-token`, { required: true }));
+    let patch;
+    try {
+        const patchResp = await octokit.rest.pulls.get({
+            owner: ctx.repo.owner,
+            repo: ctx.repo.repo,
+            [`pull_number`]: pull.number,
+            mediaType: {
+                format: `diff`,
+            },
+        });
+        if (patchResp.status !== 200) {
+            core.warning(`failed to fetch pull request patch: response status is ${patchResp.status}`);
             return ``; // don't fail the action, but analyze without patch
         }
-        try {
-            const tempDir = yield createTempDir();
-            const patchPath = path.join(tempDir, "pull.patch");
-            core.info(`Writing patch to ${patchPath}`);
-            yield writeFile(patchPath, patch);
-            return patchPath;
-        }
-        catch (err) {
-            console.warn(`failed to save pull request patch:`, err);
-            return ``; // don't fail the action, but analyze without patch
-        }
-    });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        patch = patchResp.data;
+    }
+    catch (err) {
+        console.warn(`failed to fetch pull request patch:`, err);
+        return ``; // don't fail the action, but analyze without patch
+    }
+    try {
+        const tempDir = await createTempDir();
+        const patchPath = path.join(tempDir, "pull.patch");
+        core.info(`Writing patch to ${patchPath}`);
+        await writeFile(patchPath, (0, diffUtils_1.alterDiffPatch)(patch));
+        return patchPath;
+    }
+    catch (err) {
+        console.warn(`failed to save pull request patch:`, err);
+        return ``; // don't fail the action, but analyze without patch
+    }
 }
-function prepareEnv() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const startedAt = Date.now();
-        // Prepare cache, lint and go in parallel.
-        const restoreCachePromise = (0, cache_1.restoreCache)();
-        const prepareLintPromise = prepareLint();
-        const patchPromise = fetchPatch();
-        const lintPath = yield prepareLintPromise;
-        yield restoreCachePromise;
-        const patchPath = yield patchPromise;
-        core.info(`Prepared env in ${Date.now() - startedAt}ms`);
-        return { lintPath, patchPath };
-    });
+async function prepareEnv() {
+    const startedAt = Date.now();
+    // Prepare cache, lint and go in parallel.
+    await (0, cache_1.restoreCache)();
+    const prepareLintPromise = prepareLint();
+    const patchPromise = fetchPatch();
+    const lintPath = await prepareLintPromise;
+    const patchPath = await patchPromise;
+    core.info(`Prepared env in ${Date.now() - startedAt}ms`);
+    return { lintPath, patchPath };
 }
 const printOutput = (res) => {
     if (res.stdout) {
@@ -66566,95 +66775,93 @@ const printOutput = (res) => {
         core.info(res.stderr);
     }
 };
-function runLint(lintPath, patchPath) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const debug = core.getInput(`debug`);
-        if (debug.split(`,`).includes(`cache`)) {
-            const res = yield execShellCommand(`${lintPath} cache status`);
-            printOutput(res);
+async function runLint(lintPath, patchPath) {
+    const debug = core.getInput(`debug`);
+    if (debug.split(`,`).includes(`cache`)) {
+        const res = await execShellCommand(`${lintPath} cache status`);
+        printOutput(res);
+    }
+    let userArgs = core.getInput(`args`);
+    const addedArgs = [];
+    const userArgsList = userArgs
+        .trim()
+        .split(/\s+/)
+        .filter((arg) => arg.startsWith(`-`))
+        .map((arg) => arg.replace(/^-+/, ``))
+        .map((arg) => arg.split(/=(.*)/, 2))
+        .map(([key, value]) => [key.toLowerCase(), value ?? ""]);
+    const userArgsMap = new Map(userArgsList);
+    const userArgNames = new Set(userArgsList.map(([key]) => key));
+    const formats = (userArgsMap.get("out-format") || "")
+        .trim()
+        .split(",")
+        .filter((f) => f.length > 0)
+        .filter((f) => !f.startsWith(`github-actions`))
+        .concat("github-actions")
+        .join(",");
+    addedArgs.push(`--out-format=${formats}`);
+    userArgs = userArgs.replace(/--out-format=\S*/gi, "").trim();
+    if (patchPath) {
+        if (userArgNames.has(`new`) || userArgNames.has(`new-from-rev`) || userArgNames.has(`new-from-patch`)) {
+            throw new Error(`please, don't specify manually --new* args when requesting only new issues`);
         }
-        const userArgs = core.getInput(`args`);
-        const addedArgs = [];
-        const userArgNames = new Set(userArgs
-            .trim()
-            .split(/\s+/)
-            .map((arg) => arg.split(`=`)[0])
-            .filter((arg) => arg.startsWith(`-`))
-            .map((arg) => arg.replace(/^-+/, ``)));
-        if (userArgNames.has(`out-format`)) {
-            throw new Error(`please, don't change out-format for golangci-lint: it can be broken in a future`);
+        addedArgs.push(`--new-from-patch=${patchPath}`);
+        // Override config values.
+        addedArgs.push(`--new=false`);
+        addedArgs.push(`--new-from-rev=`);
+    }
+    const workingDirectory = core.getInput(`working-directory`);
+    const cmdArgs = {};
+    if (workingDirectory) {
+        if (!fs.existsSync(workingDirectory) || !fs.lstatSync(workingDirectory).isDirectory()) {
+            throw new Error(`working-directory (${workingDirectory}) was not a path`);
         }
-        addedArgs.push(`--out-format=github-actions`);
-        if (patchPath) {
-            if (userArgNames.has(`new`) || userArgNames.has(`new-from-rev`) || userArgNames.has(`new-from-patch`)) {
-                throw new Error(`please, don't specify manually --new* args when requesting only new issues`);
-            }
-            addedArgs.push(`--new-from-patch=${patchPath}`);
-            // Override config values.
-            addedArgs.push(`--new=false`);
-            addedArgs.push(`--new-from-rev=`);
+        if (!userArgNames.has(`path-prefix`)) {
+            addedArgs.push(`--path-prefix=${workingDirectory}`);
         }
-        const workingDirectory = core.getInput(`working-directory`);
-        const cmdArgs = {};
-        if (workingDirectory) {
-            if (patchPath) {
-                // TODO: make them compatible
-                throw new Error(`options working-directory and only-new-issues aren't compatible`);
-            }
-            if (!fs.existsSync(workingDirectory) || !fs.lstatSync(workingDirectory).isDirectory()) {
-                throw new Error(`working-directory (${workingDirectory}) was not a path`);
-            }
-            if (!userArgNames.has(`path-prefix`)) {
-                addedArgs.push(`--path-prefix=${workingDirectory}`);
-            }
-            cmdArgs.cwd = path.resolve(workingDirectory);
+        cmdArgs.cwd = path.resolve(workingDirectory);
+    }
+    const cmd = `${lintPath} run ${addedArgs.join(` `)} ${userArgs}`.trimEnd();
+    core.info(`Running [${cmd}] in [${cmdArgs.cwd || ``}] ...`);
+    const startedAt = Date.now();
+    try {
+        const res = await execShellCommand(cmd, cmdArgs);
+        printOutput(res);
+        core.info(`golangci-lint found no issues`);
+    }
+    catch (exc) {
+        // This logging passes issues to GitHub annotations but comments can be more convenient for some users.
+        // TODO: support reviewdog or leaving comments by GitHub API.
+        printOutput(exc);
+        if (exc.code === 1) {
+            core.setFailed(`issues found`);
         }
-        const cmd = `${lintPath} run ${addedArgs.join(` `)} ${userArgs}`.trimRight();
-        core.info(`Running [${cmd}] in [${cmdArgs.cwd || ``}] ...`);
-        const startedAt = Date.now();
-        try {
-            const res = yield execShellCommand(cmd, cmdArgs);
-            printOutput(res);
-            core.info(`golangci-lint found no issues`);
+        else {
+            core.setFailed(`golangci-lint exit with code ${exc.code}`);
         }
-        catch (exc) {
-            // This logging passes issues to GitHub annotations but comments can be more convenient for some users.
-            // TODO: support reviewdog or leaving comments by GitHub API.
-            printOutput(exc);
-            if (exc.code === 1) {
-                core.setFailed(`issues found`);
-            }
-            else {
-                core.setFailed(`golangci-lint exit with code ${exc.code}`);
-            }
-        }
-        core.info(`Ran golangci-lint in ${Date.now() - startedAt}ms`);
-    });
+    }
+    core.info(`Ran golangci-lint in ${Date.now() - startedAt}ms`);
 }
-function run() {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            const { lintPath, patchPath } = yield core.group(`prepare environment`, prepareEnv);
-            core.addPath(path.dirname(lintPath));
-            yield core.group(`run golangci-lint`, () => runLint(lintPath, patchPath));
-        }
-        catch (error) {
-            core.error(`Failed to run: ${error}, ${error.stack}`);
-            core.setFailed(error.message);
-        }
-    });
+async function run() {
+    try {
+        const { lintPath, patchPath } = await core.group(`prepare environment`, prepareEnv);
+        core.addPath(path.dirname(lintPath));
+        await core.group(`run golangci-lint`, () => runLint(lintPath, patchPath));
+    }
+    catch (error) {
+        core.error(`Failed to run: ${error}, ${error.stack}`);
+        core.setFailed(error.message);
+    }
 }
 exports.run = run;
-function postRun() {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            yield (0, cache_1.saveCache)();
-        }
-        catch (error) {
-            core.error(`Failed to post-run: ${error}, ${error.stack}`);
-            core.setFailed(error.message);
-        }
-    });
+async function postRun() {
+    try {
+        await (0, cache_1.saveCache)();
+    }
+    catch (error) {
+        core.error(`Failed to post-run: ${error}, ${error.stack}`);
+        core.setFailed(error.message);
+    }
 }
 exports.postRun = postRun;
 
@@ -66728,6 +66935,84 @@ exports.isValidEvent = isValidEvent;
 
 /***/ }),
 
+/***/ 3617:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.alterDiffPatch = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+const path = __importStar(__nccwpck_require__(1017));
+// If needed alter diff file to be compatible with working directory
+function alterDiffPatch(patch) {
+    const workingDirectory = core.getInput(`working-directory`);
+    if (workingDirectory) {
+        return alterPatchWithWorkingDirectory(patch, workingDirectory);
+    }
+    return patch;
+}
+exports.alterDiffPatch = alterDiffPatch;
+function alterPatchWithWorkingDirectory(patch, workingDirectory) {
+    const workspace = process.env["GITHUB_WORKSPACE"] || "";
+    const wd = path.relative(workspace, workingDirectory);
+    // ignore diff sections not related to the working directory
+    let ignore = false;
+    const lines = patch.split("\n");
+    const filteredLines = [];
+    // starts with "--- a/xxx/" or "+++ a/xxx/" or "--- b/xxx/" or "+++ b/xxx/"
+    const cleanDiff = new RegExp(`^((?:\\+{3}|-{3}) [ab]\\/)${escapeRegExp(wd)}\\/(.*)`, "gm");
+    // contains " a/xxx/" or " b/xxx/"
+    const firstLine = new RegExp(`( [ab]\\/)${escapeRegExp(wd)}\\/(.*)`, "gm");
+    for (const line of lines) {
+        if (line.startsWith("diff --git")) {
+            ignore = !line.includes(` a/${wd}/`);
+            if (ignore) {
+                continue;
+            }
+            filteredLines.push(line.replaceAll(firstLine, "$1$2"));
+        }
+        else {
+            if (ignore) {
+                continue;
+            }
+            filteredLines.push(line.replaceAll(cleanDiff, "$1$2"));
+        }
+    }
+    // Join the modified lines back into a diff string
+    return filteredLines.join("\n");
+}
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
+function escapeRegExp(exp) {
+    return exp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // $& means the whole matched string
+}
+
+
+/***/ }),
+
 /***/ 1946:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -66756,15 +67041,6 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -66774,6 +67050,7 @@ const core = __importStar(__nccwpck_require__(2186));
 const httpm = __importStar(__nccwpck_require__(6255));
 const fs = __importStar(__nccwpck_require__(7147));
 const path_1 = __importDefault(__nccwpck_require__(1017));
+const install_1 = __nccwpck_require__(1649);
 const versionRe = /^v(\d+)\.(\d+)(?:\.(\d+))?$/;
 const modVersionRe = /github.com\/golangci\/golangci-lint\s(v.+)/;
 const parseVersion = (s) => {
@@ -66840,54 +67117,56 @@ const getRequestedLintVersion = () => {
     }
     return parsedRequestedLintVersion;
 };
-const getConfig = () => __awaiter(void 0, void 0, void 0, function* () {
+const getConfig = async () => {
     const http = new httpm.HttpClient(`golangci/golangci-lint-action`, [], {
         allowRetries: true,
         maxRetries: 5,
     });
     try {
         const url = `https://raw.githubusercontent.com/golangci/golangci-lint/master/assets/github-action-config.json`;
-        const response = yield http.get(url);
+        const response = await http.get(url);
         if (response.message.statusCode !== 200) {
             throw new Error(`failed to download from "${url}". Code(${response.message.statusCode}) Message(${response.message.statusMessage})`);
         }
-        const body = yield response.readBody();
+        const body = await response.readBody();
         return JSON.parse(body);
     }
     catch (exc) {
         throw new Error(`failed to get action config: ${exc.message}`);
     }
-});
-function findLintVersion() {
-    return __awaiter(this, void 0, void 0, function* () {
-        core.info(`Finding needed golangci-lint version...`);
-        const reqLintVersion = getRequestedLintVersion();
-        // if the patched version is passed, just use it
-        if ((reqLintVersion === null || reqLintVersion === void 0 ? void 0 : reqLintVersion.major) !== null && (reqLintVersion === null || reqLintVersion === void 0 ? void 0 : reqLintVersion.minor) != null && (reqLintVersion === null || reqLintVersion === void 0 ? void 0 : reqLintVersion.patch) !== null) {
-            return new Promise((resolve) => {
-                const versionWithoutV = `${reqLintVersion.major}.${reqLintVersion.minor}.${reqLintVersion.patch}`;
-                resolve({
-                    TargetVersion: `v${versionWithoutV}`,
-                    AssetURL: `https://github.com/golangci/golangci-lint/releases/download/v${versionWithoutV}/golangci-lint-${versionWithoutV}-linux-amd64.tar.gz`,
-                });
+};
+async function findLintVersion(mode) {
+    core.info(`Finding needed golangci-lint version...`);
+    if (mode == install_1.InstallMode.GoInstall) {
+        const v = core.getInput(`version`);
+        return { TargetVersion: v ? v : "latest", AssetURL: "github.com/golangci/golangci-lint" };
+    }
+    const reqLintVersion = getRequestedLintVersion();
+    // if the patched version is passed, just use it
+    if (reqLintVersion?.major !== null && reqLintVersion?.minor != null && reqLintVersion?.patch !== null) {
+        return new Promise((resolve) => {
+            const versionWithoutV = `${reqLintVersion.major}.${reqLintVersion.minor}.${reqLintVersion.patch}`;
+            resolve({
+                TargetVersion: `v${versionWithoutV}`,
+                AssetURL: `https://github.com/golangci/golangci-lint/releases/download/v${versionWithoutV}/golangci-lint-${versionWithoutV}-linux-amd64.tar.gz`,
             });
-        }
-        const startedAt = Date.now();
-        const config = yield getConfig();
-        if (!config.MinorVersionToConfig) {
-            core.warning(JSON.stringify(config));
-            throw new Error(`invalid config: no MinorVersionToConfig field`);
-        }
-        const versionConfig = config.MinorVersionToConfig[(0, exports.stringifyVersion)(reqLintVersion)];
-        if (!versionConfig) {
-            throw new Error(`requested golangci-lint version '${(0, exports.stringifyVersion)(reqLintVersion)}' doesn't exist`);
-        }
-        if (versionConfig.Error) {
-            throw new Error(`failed to use requested golangci-lint version '${(0, exports.stringifyVersion)(reqLintVersion)}': ${versionConfig.Error}`);
-        }
-        core.info(`Requested golangci-lint '${(0, exports.stringifyVersion)(reqLintVersion)}', using '${versionConfig.TargetVersion}', calculation took ${Date.now() - startedAt}ms`);
-        return versionConfig;
-    });
+        });
+    }
+    const startedAt = Date.now();
+    const config = await getConfig();
+    if (!config.MinorVersionToConfig) {
+        core.warning(JSON.stringify(config));
+        throw new Error(`invalid config: no MinorVersionToConfig field`);
+    }
+    const versionConfig = config.MinorVersionToConfig[(0, exports.stringifyVersion)(reqLintVersion)];
+    if (!versionConfig) {
+        throw new Error(`requested golangci-lint version '${(0, exports.stringifyVersion)(reqLintVersion)}' doesn't exist`);
+    }
+    if (versionConfig.Error) {
+        throw new Error(`failed to use requested golangci-lint version '${(0, exports.stringifyVersion)(reqLintVersion)}': ${versionConfig.Error}`);
+    }
+    core.info(`Requested golangci-lint '${(0, exports.stringifyVersion)(reqLintVersion)}', using '${versionConfig.TargetVersion}', calculation took ${Date.now() - startedAt}ms`);
+    return versionConfig;
 }
 exports.findLintVersion = findLintVersion;
 
