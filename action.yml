@@ -1,16 +1,19 @@
-name: "Run golangci-lint"
+# https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
+name: "Golangci-lint"
 description: "Official golangci-lint action with line-attached annotations for found issues, caching and parallel execution."
 author: "golangci"
 inputs:
   version:
     description: |
       The version of golangci-lint to use.
-      When `install-mode` is `binary` (default) the value can be v1.2 or v1.2.3 or `latest` to use the latest version.
-      When `install-mode` is `goinstall` the value can be v1.2.3, `latest`, or the hash of a commit.
+      When `install-mode` is:
+      - `binary` (default): the value can be v1.2 or v1.2.3 or `latest` to use the latest version.
+      - `goinstall`: the value can be v1.2.3, `latest`, or the hash of a commit.
+      - `none`: the value is ignored.
     required: false
-  args:
-    description: "golangci-lint command line arguments"
-    default: ""
+  install-mode:
+    description: "The mode to install golangci-lint. It can be 'binary', 'goinstall', or 'none'."
+    default: "binary"
     required: false
   working-directory:
     description: "golangci-lint working directory, default is project root"
@@ -29,17 +32,23 @@ inputs:
       takes precedence over all other caching options.
     default: 'false'
     required: false
-  skip-pkg-cache:
-    description: "if set to true then the action doesn't cache or restore ~/go/pkg."
+  skip-save-cache:
+    description: |
+      if set to true then the action will not save any caches, but it may still
+      restore existing caches, subject to other options.
     default: 'false'
     required: false
-  skip-build-cache:
-    description: "if set to true then the action doesn't cache or restore ~/.cache/go-build."
+  problem-matchers:
+    description: "Force the usage of the embedded problem matchers"
     default: 'false'
     required: false
-  install-mode:
-    description: "The mode to install golangci-lint. It can be 'binary' or 'goinstall'."
-    default: "binary"
+  args:
+    description: "golangci-lint command line arguments"
+    default: ""
+    required: false
+  cache-invalidation-interval:
+    description: "Periodically invalidate a cache because a new code being added. (number of days)"
+    default: '7'
     required: false
 runs:
   using: "node20"
@@ -47,4 +56,4 @@ runs:
   post: "dist/post_run/index.js"
 branding:
   icon: "shield"
-  color: "yellow"
+  color: "white"
